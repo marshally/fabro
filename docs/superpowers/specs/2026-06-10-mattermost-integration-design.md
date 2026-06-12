@@ -136,13 +136,22 @@ provider = "mattermost"
 channel = "fabro-reviews"
 ```
 
-### Startup log lines
+### Operational logging
 
 ```
 info!(default_channel_configured = ..., "Mattermost integration enabled")
 info!("Mattermost integration disabled by server configuration")
 info!(missing_env_vars = %..., "Mattermost integration disabled; missing credentials")
+warn!(run_id = %..., event = ..., notification_route = ..., error = %..., "Failed to post Mattermost lifecycle notification")
+warn!(run_id = %..., qid = %..., error = %..., "Failed to update Mattermost interview message")
+warn!(run_id = %..., qid = %..., invalid_key_count = ..., "Ignoring Mattermost multi-select reply with invalid option keys")
+warn!(reason = ..., "Rejected Mattermost action webhook")
 ```
+
+All log fields follow `docs/internal/logging-strategy.md`: fixed message strings, structured
+fields for run/question/route context, no raw tokens, no raw callback URLs with credentials, and no
+full Mattermost payloads. Connection errors flow into `ConnectionStatusUpdate::Error` after
+sanitization so `/api/v1/system/integrations` can show the latest non-secret failure.
 
 ## Outbound: REST Client & Message Formatting
 
@@ -168,13 +177,26 @@ Methods:
 
 `PostedMessage { post_id: String, channel_id: String }` — parallel to Slack's `PostedMessage { channel_id: String, ts: String }`. `post_id` serves the same role as `ts`: the key for looking up the original message to update it.
 
-`MattermostApiError` mirrors `SlackApiError`:
+`MattermostApiError` is the structural sibling of `SlackApiError`, but it preserves source errors
+until the boundary where they are logged or returned:
 ```rust
+#[derive(Debug, thiserror::Error)]
 pub enum MattermostApiError {
-    Http(String),
-    Api(String),
+    #[error("Mattermost HTTP error")]
+    Http(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+    #[error("Mattermost API error: {message}")]
+    Api {
+        status: Option<fabro_http::StatusCode>,
+        message: String,
+    },
+    #[error("Mattermost response parse error")]
+    Parse(#[source] serde_json::Error),
 }
 ```
+
+Do not use `map_err(|err| MattermostApiError::Http(err.to_string()))` inside the crate. Render
+with `%err` only at log/status/API projection boundaries, matching
+`docs/internal/error-handling-strategy.md`.
 
 ### `attachments.rs`
 
@@ -443,6 +465,7 @@ the round-trip test in that file.
 - `dispatch.rs`: table-driven over all `DispatchAction` variants
 - `webhook.rs`: `parse_action` for yes/no/selected; missing fields return `None`
 - thread text: multi-select key parsing accepts comma-separated keys, de-duplicates keys, rejects unknown/empty keys without delivering a text answer, and preserves freeform behavior for freeform or `allow_freeform` non-multi-select questions
+- error handling/logging: HTTP and JSON parse errors retain their source chain; webhook rejection and Mattermost post/update failures emit structured, non-secret log fields
 
 ### `fabro-server` unit tests
 
@@ -450,6 +473,7 @@ the round-trip test in that file.
 - Lifecycle routing: `route.provider == "mattermost"` routes to Mattermost service; `"slack"` routes to Slack service; each is independent
 - Settings/config: TOML with `[server.integrations.mattermost]`, notification `.mattermost`, and interview `.mattermost` parses through `fabro-config`; absent server table resolves disabled; API settings JSON includes the Mattermost fields
 - OpenAPI conformance: generated Rust API settings reuse the `fabro-types` Mattermost settings type, and the TypeScript client exposes Mattermost provider fields without hand-written DTOs
+- Connection status: WebSocket errors are sanitized before storage in `IntegrationConnectionStatus.last_error`
 
 ### Manual integration test plan
 
