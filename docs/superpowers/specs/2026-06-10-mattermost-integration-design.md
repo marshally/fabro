@@ -36,11 +36,24 @@ Mirrors `lib/crates/fabro-slack/` module for module.
 
 ### Changes to existing crates
 
+**`fabro-config`**
+- Add `mattermost: Option<MattermostIntegrationLayer>` to `ServerIntegrationsLayer`
+- Add `MattermostIntegrationLayer { enabled, url, team, default_channel }` with `#[serde(deny_unknown_fields)]`, matching the existing Slack layer style
+- Add `mattermost: Option<NotificationProviderLayer>` to `NotificationRouteLayer`
+- Add `mattermost: Option<InterviewProviderLayer>` to `InterviewsLayer`
+- Resolve the new layers into the dense `fabro-types` settings. Match Slack's activation semantics: if `[server.integrations.mattermost]` is absent, the integration is disabled; if the table is present, `enabled` defaults to `true`.
+
 **`fabro-types`**
 - Add `Principal::Mattermost { team_id: String, user_id: String, user_name: Option<String> }` variant (parallel to `Principal::Slack`)
 - Add `MattermostIntegrationSettings` to `ServerIntegrationsSettings` beside `slack`
 - Add `mattermost: Option<NotificationProviderSettings>` field to `NotificationRouteSettings` (reuses existing struct)
 - Add `mattermost: Option<InterviewProviderSettings>` field to `RunInterviewsSettings` (reuses existing struct)
+
+**`fabro-api` and OpenAPI**
+- Update `docs/public/api-reference/fabro-api.yaml` so `ServerIntegrationsSettings`, `NotificationRouteSettings`, `RunInterviewsSettings`, `IntegrationProvider`, and `Principal` expose Mattermost in the public settings/status contract
+- Add `MattermostIntegrationSettings` to `lib/crates/fabro-api/build.rs` via `with_replacement(...)` so the generated Rust API reuses the canonical `fabro-types` setting
+- Update `lib/crates/fabro-api/tests/server_settings_round_trip.rs` and principal round-trip coverage to prove type identity and JSON parity
+- Regenerate the TypeScript client with `cd lib/packages/fabro-api-client && bun run generate`
 
 **`fabro-static`**
 - Add `FABRO_MATTERMOST_TOKEN` and `FABRO_MATTERMOST_WEBHOOK_SECRET` to `EnvVars`
@@ -64,6 +77,11 @@ url = "https://mm.example.com"          # Option<InterpString> — Mattermost se
 team = "myteam"                         # Option<InterpString> — team name for channel resolution
 default_channel = "fabro-alerts"        # Option<InterpString> — mirrors SlackIntegrationSettings.default_channel
 ```
+
+The `[server.integrations.mattermost]` table is the opt-in switch. When the table is absent,
+`fabro-config` resolves Mattermost as disabled, even though the dense
+`MattermostIntegrationSettings` default keeps `enabled = true` for parity with the Slack
+settings struct.
 
 `MattermostIntegrationSettings` in `fabro-types/src/settings/server.rs`:
 ```rust
@@ -373,6 +391,8 @@ the round-trip test in that file.
 
 - Webhook handler: correct token → 200 + answer dispatched; wrong token → 401; missing token → 401
 - Lifecycle routing: `route.provider == "mattermost"` routes to Mattermost service; `"slack"` routes to Slack service; each is independent
+- Settings/config: TOML with `[server.integrations.mattermost]`, notification `.mattermost`, and interview `.mattermost` parses through `fabro-config`; absent server table resolves disabled; API settings JSON includes the Mattermost fields
+- OpenAPI conformance: generated Rust API settings reuse the `fabro-types` Mattermost settings type, and the TypeScript client exposes Mattermost provider fields without hand-written DTOs
 
 ### Manual integration test plan
 
