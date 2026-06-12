@@ -101,7 +101,7 @@ Set via `fabro secret set`. Registered in `OPTIONAL_VAULT_SECRETS`.
 | Secret | Purpose |
 |---|---|
 | `FABRO_MATTERMOST_TOKEN` | Bot/personal access token. Used for all REST API calls (`Authorization: Bearer`) and WebSocket authentication. Single token — no equivalent of Slack's separate app token. |
-| `FABRO_MATTERMOST_WEBHOOK_SECRET` | Random token embedded as `?token=` in every action button's `integration.url`. Handler verifies with constant-time compare before processing any inbound action. |
+| `FABRO_MATTERMOST_WEBHOOK_SECRET` | HMAC key for signing each button's confidential `integration.context`. The secret itself is never placed in `integration.url`, message text, logs, or action context. |
 
 Credential resolution follows the same pattern as Slack:
 ```rust
@@ -188,11 +188,14 @@ Builds one attachment:
 - `title`: question text (truncated to Mattermost's 200-char attachment title limit)
 - `text`: `context_display` if present (truncated)
 - `actions`: array of button objects
-  - Yes/No: two buttons with `integration.context: { run_id, qid, kind: "yes"|"no" }`
-  - Multiple-choice: one button per option, `kind: "selected"`, `key: <option_key>`
+  - Yes/No: two buttons with `integration.context: { run_id, qid, kind: "yes"|"no", sig }`
+  - Multiple-choice: one button per option, `kind: "selected"`, `key: <option_key>`, `sig`
   - Freeform: no buttons — user replies in thread
   - Multi-select: note in `text` asking for comma-separated reply (thread-based; no button UX)
-- Each button's `integration.url` is `{action_callback_base_url}/api/v1/webhooks/mattermost?token={FABRO_MATTERMOST_WEBHOOK_SECRET}`
+- Each button's `integration.url` is `{action_callback_base_url}/api/v1/webhooks/mattermost`
+- `sig` is an HMAC-SHA256 over the stable action fields (`run_id`, `qid`, `kind`, and
+  optional `key`) using `FABRO_MATTERMOST_WEBHOOK_SECRET`. The webhook handler recomputes and
+  constant-time verifies it before loading run state or dispatching an answer.
 - `run_web_url` is only the human-facing run deep link. It must not be reused as the callback
   base, because `AppState::run_web_url()` resolves to `/runs/{run_id}`.
 - `action_callback_base_url` is the canonical public server origin with no trailing slash. It
@@ -266,14 +269,16 @@ network policy before button interviews are considered configured.
 
 ### Security
 
-`FABRO_MATTERMOST_WEBHOOK_SECRET` is embedded as `?token=<secret>` in the `integration.url`
-of every action button at message-build time. The handler extracts the `token` query parameter
-and performs a constant-time byte comparison against the vault secret before touching the body.
-Requests with missing or mismatched tokens return `401`.
+`FABRO_MATTERMOST_WEBHOOK_SECRET` signs every button action context at message-build time. The
+handler parses only the Mattermost action envelope, extracts `context.sig`, recomputes the HMAC
+from the other context fields, and performs a constant-time comparison before loading run state
+or dispatching an answer. Requests with missing or mismatched signatures return `401`.
 
 *Diverges from Slack*: Slack uses Socket Mode (the server never receives inbound HTTP for
 interactions). Mattermost has no Socket Mode; interactive button actions require an inbound
-HTTP endpoint. The token-in-URL pattern is the standard Mattermost integration security model.
+HTTP endpoint. Mattermost's interactive-message `context` is the confidential channel for this
+authenticator; the public `integration.url` stays free of secrets so HTTP access logs and URL
+redaction do not become part of the security boundary.
 
 ### `webhook.rs`
 
@@ -289,13 +294,15 @@ Mattermost POSTs `application/json` to `integration.url` when a button is clicke
     "run_id": "...",
     "qid": "...",
     "kind": "yes|no|selected|submit_multi",
-    "key": "..."
+    "key": "...",
+    "sig": "hex-encoded-hmac-sha256"
   }
 }
 ```
 
 `parse_action(payload)` → `Option<MattermostAnswerSubmission>`:
 - Extracts `context.run_id`, `context.qid`, `context.kind`, `context.key`
+- Verifies `context.sig` against those fields using `FABRO_MATTERMOST_WEBHOOK_SECRET`
 - Builds `Answer` (yes/no/selected/multi-selected) from `kind` + `key`
 - Builds `actor: Principal::Mattermost { team_id, user_id, user_name }`
 
@@ -409,7 +416,7 @@ the round-trip test in that file.
 
 ### `fabro-server` unit tests
 
-- Webhook handler: correct token → 200 + answer dispatched; wrong token → 401; missing token → 401
+- Webhook handler: valid action signature → 200 + answer dispatched; wrong signature → 401; missing signature → 401
 - Lifecycle routing: `route.provider == "mattermost"` routes to Mattermost service; `"slack"` routes to Slack service; each is independent
 - Settings/config: TOML with `[server.integrations.mattermost]`, notification `.mattermost`, and interview `.mattermost` parses through `fabro-config`; absent server table resolves disabled; API settings JSON includes the Mattermost fields
 - OpenAPI conformance: generated Rust API settings reuse the `fabro-types` Mattermost settings type, and the TypeScript client exposes Mattermost provider fields without hand-written DTOs
