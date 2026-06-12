@@ -48,6 +48,8 @@ Mirrors `lib/crates/fabro-slack/` module for module.
 - Add `MattermostIntegrationSettings` to `ServerIntegrationsSettings` beside `slack`
 - Add `mattermost: Option<NotificationProviderSettings>` field to `NotificationRouteSettings` (reuses existing struct)
 - Add `mattermost: Option<InterviewProviderSettings>` field to `RunInterviewsSettings` (reuses existing struct)
+- Add `IntegrationProvider::Mattermost` for `/api/v1/system/integrations`
+- Add `IntegrationConnectionKind::WebSocket` so native Mattermost WebSocket status is not mislabeled as Slack Socket Mode
 
 **`fabro-api` and OpenAPI**
 - Update `docs/public/api-reference/fabro-api.yaml` so `ServerIntegrationsSettings`, `NotificationRouteSettings`, `RunInterviewsSettings`, `IntegrationProvider`, and `Principal` expose Mattermost in the public settings/status contract
@@ -64,6 +66,7 @@ Mirrors `lib/crates/fabro-slack/` module for module.
 - Add `mattermost_service: Option<Arc<MattermostService>>` and `mattermost_started: AtomicBool` to `AppState`
 - Add `start_optional_mattermost_service()` function
 - Add `POST /api/v1/webhooks/mattermost` route
+- Add Mattermost to the system integrations handler beside Slack, including missing credential reporting and live connection status
 - Call both from `build_router_with_options()`
 
 ## Config & Secrets
@@ -377,7 +380,7 @@ Methods (all parallel to `SlackService`):
 - `handle_lifecycle_event(state, envelope, run_web_url)` — filters `route.provider == "mattermost"`, reads `route.mattermost.channel`, resolves channel ID, posts lifecycle attachment
 - `finish_interview(run_id, qid, question, answer_text)` — updates original post with `answered_attachments`
 - `submit_answer(state, submission)` — loads the pending question, resolves `MattermostAnswerInput` into an `Answer`, then routes to `submit_pending_interview_answer`
-- `connection_status()` → `IntegrationConnectionStatus`
+- `connection_status()` → `IntegrationConnectionStatus { kind: IntegrationConnectionKind::WebSocket, ... }`
 - `status_sink()` → `ConnectionStatusSink`
 
 The service stores `callback_base_url` separately from `run_web_url`. The event listener still
@@ -419,6 +422,36 @@ Webhook route added to the API router:
 ```rust
 .route("/api/v1/webhooks/mattermost", post(handler::mattermost_webhook))
 ```
+
+### System integration status
+
+`GET /api/v1/system/integrations` includes one Mattermost row:
+
+```json
+{
+  "provider": "mattermost",
+  "enabled": true,
+  "configured": true,
+  "status": "connected",
+  "missing_credentials": [],
+  "connection": {
+    "kind": "websocket",
+    "status": "connected",
+    "last_connected_at": "...",
+    "last_error": null
+  },
+  "metadata": {
+    "url_configured": "true",
+    "team_configured": "true",
+    "default_channel_configured": "true"
+  }
+}
+```
+
+Status resolution mirrors Slack: disabled config returns `disabled`; missing
+`FABRO_MATTERMOST_TOKEN` or `FABRO_MATTERMOST_WEBHOOK_SECRET` returns
+`missing_credentials`; configured but not yet connected returns `configured` or `connecting`;
+WebSocket failures return `error` with sanitized `last_error`.
 
 ### AppState construction
 
@@ -474,6 +507,7 @@ the round-trip test in that file.
 - Settings/config: TOML with `[server.integrations.mattermost]`, notification `.mattermost`, and interview `.mattermost` parses through `fabro-config`; absent server table resolves disabled; API settings JSON includes the Mattermost fields
 - OpenAPI conformance: generated Rust API settings reuse the `fabro-types` Mattermost settings type, and the TypeScript client exposes Mattermost provider fields without hand-written DTOs
 - Connection status: WebSocket errors are sanitized before storage in `IntegrationConnectionStatus.last_error`
+- System integration status: Mattermost appears as `provider = "mattermost"` with `connection.kind = "websocket"`; missing vault secrets report only key names
 
 ### Manual integration test plan
 
