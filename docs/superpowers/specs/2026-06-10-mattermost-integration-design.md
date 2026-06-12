@@ -181,7 +181,7 @@ pub enum MattermostApiError {
 Mattermost uses `props.attachments` (Slack-compatible attachment objects) instead of Block Kit.
 Same conceptual outputs, different JSON wire format.
 
-**`question_to_attachments(run_id, qid, question, run_web_url)`**
+**`question_to_attachments(run_id, qid, question, run_web_url, action_callback_base_url)`**
 
 Builds one attachment:
 - `color`: `"#0072C6"` (neutral blue for questions)
@@ -192,7 +192,12 @@ Builds one attachment:
   - Multiple-choice: one button per option, `kind: "selected"`, `key: <option_key>`
   - Freeform: no buttons — user replies in thread
   - Multi-select: note in `text` asking for comma-separated reply (thread-based; no button UX)
-- Each button's `integration.url` is `{server_web_url}/api/v1/webhooks/mattermost?token={FABRO_MATTERMOST_WEBHOOK_SECRET}`
+- Each button's `integration.url` is `{action_callback_base_url}/api/v1/webhooks/mattermost?token={FABRO_MATTERMOST_WEBHOOK_SECRET}`
+- `run_web_url` is only the human-facing run deep link. It must not be reused as the callback
+  base, because `AppState::run_web_url()` resolves to `/runs/{run_id}`.
+- `action_callback_base_url` is the canonical public server origin with no trailing slash. It
+  resolves from the same public origin Fabro already uses for web/API traffic (`server.web.url`)
+  and is computed independently of the per-run deep link.
 
 **`run_lifecycle_attachments(kind, details)`**
 
@@ -250,6 +255,15 @@ question is posted (freeform or `allow_freeform` questions); looked up on `poste
 
 `POST /api/v1/webhooks/mattermost` added to `build_router_with_options()`.
 
+### Callback reachability
+
+Mattermost button actions are delivered by the Mattermost server, not by the user's browser.
+The `integration.url` therefore must be reachable from the Mattermost server process at the
+canonical public Fabro origin. Local-only callback URLs only work when Mattermost can reach the
+same host and port. For self-hosted Mattermost instances that block internal callback targets,
+the operator must explicitly allow the Fabro host according to Mattermost's interactive-message
+network policy before button interviews are considered configured.
+
 ### Security
 
 `FABRO_MATTERMOST_WEBHOOK_SECRET` is embedded as `?token=<secret>` in the `integration.url`
@@ -305,6 +319,7 @@ struct MattermostService {
     client:          MattermostClient,
     team:            String,
     default_channel: Option<String>,
+    callback_base_url: String,
     posted_messages: Arc<Mutex<HashMap<(RunId, String), PostedMessage>>>,
     thread_registry: Arc<ThreadRegistry>,
     connection:      Arc<Mutex<MattermostConnectionRuntimeState>>,
@@ -318,6 +333,10 @@ Methods (all parallel to `SlackService`):
 - `submit_answer(state, submission)` — routes to `submit_pending_interview_answer`
 - `connection_status()` → `IntegrationConnectionStatus`
 - `status_sink()` → `ConnectionStatusSink`
+
+The service stores `callback_base_url` separately from `run_web_url`. The event listener still
+computes `run_web_url` per event for human deep links, while Mattermost action buttons always use
+the server-level callback base.
 
 Interview routing uses `default_channel` (from server config) for questions, matching the
 current Slack behavior. The `[run.interviews.mattermost].channel` config field is added to the
@@ -351,6 +370,7 @@ let mattermost_service = {
     let mm_settings = &current_server_settings.server.integrations.mattermost;
     if mm_settings.enabled {
         // resolve url, team, default_channel from settings
+        // resolve callback_base_url from the canonical public server origin
         // resolve credentials from vault
         // log enabled / disabled-missing-credentials
     } else {
