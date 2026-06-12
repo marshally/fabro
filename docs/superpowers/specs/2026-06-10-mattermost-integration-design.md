@@ -191,7 +191,7 @@ Builds one attachment:
   - Yes/No: two buttons with `integration.context: { run_id, qid, kind: "yes"|"no", sig }`
   - Multiple-choice: one button per option, `kind: "selected"`, `key: <option_key>`, `sig`
   - Freeform: no buttons — user replies in thread
-  - Multi-select: note in `text` asking for comma-separated reply (thread-based; no button UX)
+  - Multi-select: no buttons — text lists each option as ``<key>` — <label>`` and asks for a comma-separated reply of option keys
 - Each button's `integration.url` is `{action_callback_base_url}/api/v1/webhooks/mattermost`
 - `sig` is an HMAC-SHA256 over the stable action fields (`run_id`, `qid`, `kind`, and
   optional `key`) using `FABRO_MATTERMOST_WEBHOOK_SECRET`. The webhook handler recomputes and
@@ -222,8 +222,9 @@ Mirrors `fabro-slack/src/connection.rs` structurally.
 1. Connect: `tokio_tungstenite::connect_async("wss://<host>/api/v4/websocket")`
 2. Authenticate: send `{ "seq": 1, "action": "authentication_challenge", "data": { "token": "<FABRO_MATTERMOST_TOKEN>" } }`
 3. Loop: read messages, dispatch, handle `Message::Ping` with `Pong`, break on `Close`
-4. On `posted` event: parse `data.post` (a JSON-encoded string within the event), extract `root_id` and `message`
-5. Look up `root_id` in `ThreadRegistry` → `(run_id, qid)` → dispatch `SubmitAnswer`
+4. On `posted` event: parse `data.post` (a JSON-encoded string within the event), extract `root_id`, `message`, `user_id`, and `user_name`
+5. Ignore bot posts, empty messages, and posts without `root_id`
+6. Look up `root_id` in `ThreadRegistry` → `(run_id, qid)` → dispatch a thread-text submission
 
 *Diverges from Slack*: Mattermost encodes the post as a JSON string inside the event's `data`
 field (`data.post` is `"{\"id\":\"...\",\"root_id\":\"...\",\"message\":\"...\"}"`), requiring
@@ -244,7 +245,9 @@ pub enum DispatchAction {
 }
 ```
 
-Classifies events: `hello` → `Connected`, `posted` with registered `root_id` → `SubmitAnswer`, `goodbye` → `Reconnect`, everything else → `Ignored`.
+Classifies events: `hello` → `Connected`, `posted` with registered `root_id` → `SubmitAnswer`
+with `MattermostAnswerInput::ThreadText(message)`, `goodbye` → `Reconnect`, everything else →
+`Ignored`.
 
 ### `threads.rs`
 
@@ -293,7 +296,7 @@ Mattermost POSTs `application/json` to `integration.url` when a button is clicke
   "context": {
     "run_id": "...",
     "qid": "...",
-    "kind": "yes|no|selected|submit_multi",
+    "kind": "yes|no|selected",
     "key": "...",
     "sig": "hex-encoded-hmac-sha256"
   }
@@ -303,10 +306,24 @@ Mattermost POSTs `application/json` to `integration.url` when a button is clicke
 `parse_action(payload)` → `Option<MattermostAnswerSubmission>`:
 - Extracts `context.run_id`, `context.qid`, `context.kind`, `context.key`
 - Verifies `context.sig` against those fields using `FABRO_MATTERMOST_WEBHOOK_SECRET`
-- Builds `Answer` (yes/no/selected/multi-selected) from `kind` + `key`
+- Builds `MattermostAnswerInput::Direct(Answer)` for yes/no/selected button actions
 - Builds `actor: Principal::Mattermost { team_id, user_id, user_name }`
 
-`MattermostAnswerSubmission { run_id, qid, answer, actor }` — parallel to `SlackAnswerSubmission`.
+Thread replies build the same submission shape with `MattermostAnswerInput::ThreadText(message)`.
+
+```rust
+pub enum MattermostAnswerInput {
+    Direct(Answer),
+    ThreadText(String),
+}
+
+pub struct MattermostAnswerSubmission {
+    pub run_id: String,
+    pub qid:    String,
+    pub input:  MattermostAnswerInput,
+    pub actor:  Principal,
+}
+```
 
 ## Server Wiring (`fabro-server`)
 
@@ -337,13 +354,25 @@ Methods (all parallel to `SlackService`):
 - `handle_event(state, envelope, run_web_url)` — dispatches on `EventBody` variant
 - `handle_lifecycle_event(state, envelope, run_web_url)` — filters `route.provider == "mattermost"`, reads `route.mattermost.channel`, resolves channel ID, posts lifecycle attachment
 - `finish_interview(run_id, qid, question, answer_text)` — updates original post with `answered_attachments`
-- `submit_answer(state, submission)` — routes to `submit_pending_interview_answer`
+- `submit_answer(state, submission)` — loads the pending question, resolves `MattermostAnswerInput` into an `Answer`, then routes to `submit_pending_interview_answer`
 - `connection_status()` → `IntegrationConnectionStatus`
 - `status_sink()` → `ConnectionStatusSink`
 
 The service stores `callback_base_url` separately from `run_web_url`. The event listener still
 computes `run_web_url` per event for human deep links, while Mattermost action buttons always use
 the server-level callback base.
+
+For `MattermostAnswerInput::ThreadText`, `submit_answer` resolves answers after loading the
+pending `InterviewQuestionRecord`:
+- `QuestionType::MultiSelect`: split the reply on commas, trim each token, reject empty tokens,
+  match tokens exactly against `option.key`, de-duplicate repeated keys while preserving first
+  occurrence, and submit `Answer::multi_selected(keys)`. Unknown keys leave the question pending
+  and log a `warn!` with `run_id`, `qid`, and the invalid key count.
+- `QuestionType::Freeform`: submit `Answer::text(message)` when non-empty.
+- Any question with `allow_freeform = true` except multi-select: submit `Answer::text(message)`
+  when non-empty.
+- Other question shapes ignore thread text so button-only questions cannot be answered by
+  arbitrary replies.
 
 Interview routing uses `default_channel` (from server config) for questions, matching the
 current Slack behavior. The `[run.interviews.mattermost].channel` config field is added to the
@@ -410,9 +439,10 @@ the round-trip test in that file.
 - `config.rs`: credential resolution with all combinations of present/absent/empty secrets
 - `client.rs`: `parse_post_message_response`, `resolve_channel` cache behavior
 - `attachments.rs`: `question_to_attachments` for each `QuestionType`, `run_lifecycle_attachments` for each `RunLifecycleKind`, `answered_attachments`; truncation at Mattermost limits
-- `connection.rs`: `process_message` for `hello`, `posted` (registered + unregistered thread), `goodbye`, malformed JSON
+- `connection.rs`: `process_message` for `hello`, `posted` (registered + unregistered thread), bot posts, empty messages, `goodbye`, malformed JSON
 - `dispatch.rs`: table-driven over all `DispatchAction` variants
 - `webhook.rs`: `parse_action` for yes/no/selected; missing fields return `None`
+- thread text: multi-select key parsing accepts comma-separated keys, de-duplicates keys, rejects unknown/empty keys without delivering a text answer, and preserves freeform behavior for freeform or `allow_freeform` non-multi-select questions
 
 ### `fabro-server` unit tests
 
@@ -431,7 +461,8 @@ Against `docker run --name mattermost-preview -p 8065:8065 mattermost/mattermost
 5. Trigger a run; confirm lifecycle notification appears in `town-square`
 6. Trigger a run with a yes/no interview; confirm question with buttons appears; click Yes; confirm answer is recorded and post updates
 7. Trigger a run with a freeform interview; confirm question appears; reply in thread; confirm answer is recorded
-8. Confirm Slack integration is unaffected throughout
+8. Trigger a run with a multi-select interview; confirm the prompt lists option keys; reply with two comma-separated keys; confirm a `multi_selected` answer is recorded
+9. Confirm Slack integration is unaffected throughout
 
 ## Docs
 
