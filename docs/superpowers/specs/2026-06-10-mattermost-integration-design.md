@@ -512,20 +512,34 @@ the round-trip test in that file.
 ### Manual integration test plan
 
 Against `docker run --name mattermost-preview -p 8065:8065 mattermost/mattermost-preview`:
-1. Create a bot account, generate a personal access token → set `FABRO_MATTERMOST_TOKEN`
-2. Generate a random webhook secret → set `FABRO_MATTERMOST_WEBHOOK_SECRET`
-3. Configure `[server.integrations.mattermost]` pointing at `http://localhost:8065`, team `ad-1`, channel `town-square`
-4. Start Fabro server; confirm "Mattermost integration enabled" in logs and WebSocket connects
-5. Trigger a run; confirm lifecycle notification appears in `town-square`
-6. Trigger a run with a yes/no interview; confirm question with buttons appears; click Yes; confirm answer is recorded and post updates
-7. Trigger a run with a freeform interview; confirm question appears; reply in thread; confirm answer is recorded
-8. Trigger a run with a multi-select interview; confirm the prompt lists option keys; reply with two comma-separated keys; confirm a `multi_selected` answer is recorded
-9. Confirm Slack integration is unaffected throughout
+1. In Mattermost system console, enable bot accounts and personal access tokens if the local
+   preview image has them disabled.
+2. Create a bot account, add it to the target team and channels, and generate a personal access
+   token → set `FABRO_MATTERMOST_TOKEN`.
+3. Confirm the bot can create posts, create threaded replies, and update its own posts in the
+   target channel.
+4. Configure callback reachability: the Mattermost container must be able to reach Fabro's
+   `action_callback_base_url`; if Mattermost blocks internal callback URLs, allow the Fabro host
+   in Mattermost's interactive-message network settings.
+5. Generate a random webhook signing secret → set `FABRO_MATTERMOST_WEBHOOK_SECRET`.
+6. Configure `[server.integrations.mattermost]` pointing at `http://localhost:8065`, team
+   `ad-1`, channel `town-square`.
+7. Start Fabro server; confirm "Mattermost integration enabled" in logs and WebSocket connects.
+8. Trigger a run; confirm lifecycle notification appears in `town-square`.
+9. Trigger a run with a yes/no interview; confirm question with buttons appears; click Yes;
+   confirm answer is recorded and post updates.
+10. Trigger a run with a freeform interview; confirm question appears; reply in thread; confirm
+    answer is recorded.
+11. Trigger a run with a multi-select interview; confirm the prompt lists option keys; reply with
+    two comma-separated keys; confirm a `multi_selected` answer is recorded.
+12. Confirm Slack integration is unaffected throughout.
 
 ## Docs
 
 - New page: `docs/public/integrations/mattermost.mdx` (mirrors the Slack integration page)
 - Updated: `docs/public/administration/server-configuration.mdx` — add `[server.integrations.mattermost]` section and both new secrets to the secrets table
+- The Mattermost docs page must include bot-account/PAT prerequisites, channel membership, post
+  update permission expectations, and callback reachability/allowed-internal-connection guidance.
 - Updated: `docs/public/llms.txt` — add Mattermost integration page entry
 - Updated: `.env.example` — add `FABRO_MATTERMOST_TOKEN` and `FABRO_MATTERMOST_WEBHOOK_SECRET` (commented out)
 
